@@ -1,0 +1,531 @@
+### Code
+## Data loading
+
+load packages we need for the project
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(sp)
+library(sf)
+library(spdep)
+library(tmap)
+library(spatstat)
+library(readxl)
+library(purrr)
+library(lmtest)
+library(sandwich)
+library(modelsummary)
+library(pandoc)
+library(car)
+library(broom)
+library(GWmodel)
+library(corrplot)
+
+```
+
+Read in gpg data
+
+```{r}
+#—— 1.1 Gender Pay Gap (ASHE 2021, Home geography) ————————
+ashe_path <- "data/gpg_la_home.xls"
+ashe_sheets <- excel_sheets(ashe_path)             
+# print(ashe_sheets)
+
+gpg <- read_excel(ashe_path, sheet = 2, skip = 4) |>
+  clean_names() |>
+  transmute(
+    la_code = code,
+    la_name = description,
+    gpg_median = median,
+    gpg_mean = mean)
+```
+
+clean gpg data
+
+```{r}
+gpg_clean <- gpg %>%                                   
+  mutate(across(everything(), ~ na_if(.x, "x"))) %>%   
+  mutate(across(everything(), ~ na_if(.x, ":"))) %>%   
+  type_convert() %>%                                   
+  filter(!is.na(la_code)) 
+```
+
+load GEI now
+```{r}
+gei <- read_csv("data/index_g.csv")
+```
+merge 
+```{r}
+lad_lookup <- read_csv("data/lad22_lookup.csv", show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  transmute(
+    la_code = toupper(str_trim(lad22cd)),
+    la_name = tolower(str_trim(lad22nm)),
+    urban_rural_flag = tolower(str_trim(urban_rural_flag))
+  )
+
+gpg_df <- gpg_clean %>%
+  mutate(
+    la_code = toupper(str_trim(la_code)),
+    la_name = tolower(str_trim(la_name))
+  )
+
+gei_df <- gei %>%
+  mutate(
+    la_name = tolower(str_trim(`Local authority`)))
+
+gpg_df <- gpg_df %>%
+  mutate(la_name = tolower(str_trim(la_name))) %>%
+  left_join(lad_lookup, by = "la_name") %>%
+  mutate(la_code = coalesce(la_code.x, la_code.y)) %>%
+  select(-la_code.x, -la_code.y)
+
+gei_df <- gei_df %>%
+  left_join(lad_lookup, by = "la_name")
+
+head(gei_df)
+
+sum(is.na(gei_df$la_code))
+
+```
+
+manually check na value and read again
+then run the baseline regression
+```{r}
+gei_df <- read_csv("geiuk_with_code.csv", show_col_types = FALSE)
+
+gei_total <- read_csv("data/gei_total.csv", show_col_types = FALSE) %>%
+  mutate(la_name = tolower(str_trim(`la_name`))) %>%
+  left_join(lad_lookup, by = "la_name")
+
+gei_men <- read_csv("data/gei_men.csv", show_col_types = FALSE) %>%
+  mutate(la_name = tolower(str_trim(`la_name`))) %>%
+  left_join(lad_lookup, by = "la_name")
+
+gei_women <- read_csv("data/gei_women.csv", show_col_types = FALSE) %>%
+  mutate(la_name = tolower(str_trim(`la_name`))) %>%
+  left_join(lad_lookup, by = "la_name")
+
+reg_df <- gpg_df %>%
+  left_join(gei_df, by = "la_code")%>%
+  left_join(gei_total, by = "la_code") %>%
+  left_join(gei_men, by = "la_code") %>%
+  left_join(gei_women, by = "la_code")
+
+reg_df <- reg_df %>%
+  select(-matches("\\.y$"))
+
+reg_df <- reg_df %>%
+  mutate(
+    index_g = coalesce(index_g.x),
+    index_w = coalesce(index_w.x),
+    index_m = coalesce(index_m.x),
+    urban_rural_flag = coalesce(urban_rural_flag.x,urban_rural_flag.x.x),
+  ) %>%
+  select(-matches("\\.x$"))
+
+
+```
+
+descriptive statistics
+
+```{r}
+vars <- reg_df %>% select(gpg_mean, gpg_median, index_g, index_m, index_w,`paid work_g`,`Paid work_m`,`Paid work_w`,`unpaid work_g`,`Unpaid work_m`,`Unpaid work_w`,money_g,Money_w,Money_w,power_g,Power_m,Power_w,education_g,Education_m,Education_w,health_g,Health_m,Health_w)
+
+datasummary_skim(vars, output = "summary_stats.docx")
+
+```
+
+baseline regression
+
+```{r}
+model_total_mean_g <- lm(gpg_mean ~ index_g, data = reg_df)
+summary(model_total_mean_g)
+
+model_total_median_g <- lm(gpg_median ~ index_g, data = reg_df)
+summary(model_total_median_g)
+
+model_total_mean_w <- lm(gpg_mean ~ index_w, data = reg_df)
+summary(model_total_mean_w)
+
+model_total_median_w <- lm(gpg_median ~ index_w, data = reg_df)
+summary(model_total_median_w)
+
+model_total_mean_m <- lm(gpg_mean ~ index_m, data = reg_df)
+summary(model_total_mean_m)
+
+model_total_median_m <- lm(gpg_median ~ index_m, data = reg_df)
+summary(model_total_median_m)
+
+modelsummary(
+  list(
+    "Mean: GEI Total"  = model_total_mean_g,
+    "Median: GEI Total"= model_total_median_g,
+    "Mean: GEI Women"  = model_total_mean_w,
+    "Median: GEI Women"= model_total_median_w,
+    "Mean: GEI Men"    = model_total_mean_m,
+    "Median: GEI Men"  = model_total_median_m
+  ),
+  stars = c('*' = .05, '**' = .01, '***' = .001),
+  output = "reg_results.docx"
+)
+```
+
+2、 Mechanism Analysis
+
+```{r}
+
+vars <- reg_df %>% select(gpg_mean, gpg_median, index_g, index_m, index_w,`paid work_g`,`Paid work_m`,`Paid work_w`,`unpaid work_g`,`Unpaid work_m`,`Unpaid work_w`,money_g,Money_m,Money_w,power_g,Power_m,Power_w,education_g,Education_m,Education_w,health_g,Health_m,Health_w)
+
+cor_mat <- cor(vars, use = "complete.obs")
+
+corrplot(cor_mat, method = 'color', order = 'original',
+          tl.col = "black", tl.srt = 45, number.cex = 0.7)
+
+corrplot(cor_mat,
+         method = "color",         # 颜色填充
+         type = "upper",           # 只显示上三角
+         order = "hclust",         # 聚类排列更美观
+         tl.col = "black",         # 变量名黑色
+         tl.srt = 45,              # 变量名旋转45°
+         addCoef.col = "white",    # 格内添加相关数值，白色
+         number.cex = 0.6,         # 数值字体大小
+         mar = c(1, 1, 1, 1)       # 边距
+)
+
+```
+
+```{r}
+names(reg_df)
+
+```
+
+```{r}
+model2_mean_g <- lm(gpg_mean ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = reg_df)
+summary(model2_mean_g)
+
+model2_median_g <- lm(gpg_median ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = reg_df)
+summary(model2_median_g)
+
+model2_mean_w <- lm(gpg_mean ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = reg_df)
+summary(model2_mean_w)
+
+model2_median_w <- lm(gpg_median ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = reg_df)
+summary(model2_median_w)
+
+model2_mean_m <- lm(gpg_mean ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = reg_df)
+summary(model2_mean_m)
+
+model2_median_m <- lm(gpg_median ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = reg_df)
+summary(model2_median_m)
+
+
+
+
+
+models <- list(
+  "Mean: All"     = model2_mean_g,
+  "Median: All"   = model2_median_g,
+  "Mean: Women"   = model2_mean_w,
+  "Median: Women" = model2_median_w,
+  "Mean: Men"     = model2_mean_m,
+  "Median: Men"   = model2_median_m
+)
+
+
+var_names <- c(
+  "paid work_g"     = "Paid Work",
+  "unpaid work_g"   = "Unpaid Work",
+  "money_g"         = "Money",
+  "power_g"         = "Power",
+  "education_g"     = "Education",
+  "health_g"        = "Health",
+  "Paid work_w"     = "Paid Work (W)",
+  "Unpaid work_w"   = "Unpaid Work (W)",
+  "Money_w"         = "Money (W)",
+  "Power_w"         = "Power (W)",
+  "Education_w"     = "Education (W)",
+  "Health_w"        = "Health (W)",
+  "Paid work_m"     = "Paid Work (M)",
+  "Unpaid work_m"   = "Unpaid Work (M)",
+  "Money_m"         = "Money (M)",
+  "Power_m"         = "Power (M)",
+  "Education_m"     = "Education (M)",
+  "Health_m"        = "Health (M)"
+)
+
+# 生成回归表（显示显著性星号、置信区间、观测数、R²等）
+modelsummary(
+  models,
+  stars = TRUE,
+  coef_map = var_names,     # 显示自定义变量名
+  statistic = "({std.error})", # 括号里显示标准误
+  gof_omit = "IC|Log.Lik.",    # 可去掉AIC/BIC/LogLik等冗余指标
+  output = "model2_table.docx" # 直接导出Word文档，改成"model2_table.html"导出网页表
+)
+
+
+```
+
+gwr
+
+```{r}
+
+shp <- st_read("data/Local_Authority_Districts/LAD_MAY_2021_UK_BFE_V2.shp")
+
+shp <- shp %>%
+  select(la_code = LAD21CD, geometry)
+
+gwr_data <- left_join(shp, reg_df, by = "la_code")
+gwr_data_nona <- gwr_data %>%
+  drop_na()   
+```
+
+```{r}
+library(spdep)
+
+# 假设你有如下回归公式
+formulas <- list(
+  mean_g = gpg_mean ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g,
+  median_g = gpg_median ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g,
+  mean_w = gpg_mean ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w,
+  median_w = gpg_median ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w,
+  mean_m = gpg_mean ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m,
+  median_m = gpg_median ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m
+)
+
+# 邻接矩阵（如之前 poly2nb/gwr_data_nona）
+nb <- poly2nb(gwr_data_nona, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# 循环计算每个模型残差的空间自相关
+moran_results <- lapply(formulas, function(fm) {
+  fit <- lm(fm, data = st_drop_geometry(gwr_data_nona))
+  resid <- residuals(fit)
+  moran.test(resid, lw, zero.policy = TRUE)
+})
+
+# 输出结果
+names(moran_results) <- names(formulas)
+lapply(moran_results, function(x) x$p.value)
+
+
+```
+```{r}
+names(gwr_data_nona) <- tolower(gsub("\\s+", "_", names(gwr_data_nona)))
+
+formulas <- list(
+  mean_g   = gpg_mean ~ paid_work_g + unpaid_work_g + money_g + power_g + education_g + health_g,
+  median_g = gpg_median ~ paid_work_g + unpaid_work_g + money_g + power_g + education_g + health_g,
+  mean_w   = gpg_mean ~ paid_work_w + unpaid_work_w + money_w + power_w + education_w + health_w,
+  median_w = gpg_median ~ paid_work_w + unpaid_work_w + money_w + power_w + education_w + health_w,
+  mean_m   = gpg_mean ~ paid_work_m + unpaid_work_m + money_m + power_m + education_m + health_m,
+  median_m = gpg_median ~ paid_work_m + unpaid_work_m + money_m + power_m + education_m + health_m
+)
+
+
+library(sf)
+library(tmap)
+library(dplyr)
+library(readr)
+
+coords <- sf::st_coordinates(sf::st_centroid(gwr_data_nona))
+sp_data <- as(gwr_data_nona, "Spatial")
+
+gwr_results <- list()
+
+for (name in names(formulas)) {
+  cat("\n======\n正在拟合 GWR 模型:", name, "...\n")
+  fm <- formulas[[name]]
+
+  bw <- bw.gwr(fm, data = sp_data, approach = "AICc", kernel = "bisquare", adaptive = TRUE)
+  cat("  → 选择带宽:", bw, "\n")
+
+  gwr_fit <- gwr.basic(fm, data = sp_data, bw = bw, kernel = "bisquare", adaptive = TRUE)
+  gwr_results[[name]] <- gwr_fit
+
+  out_file <- paste0("data/gwr_coef_", name, ".csv")
+  write_csv(as.data.frame(gwr_fit$SDF@data), out_file)
+  cat("  → 已导出系数到:", out_file, "\n")
+
+  # -----★输出所有变量显著性地图-----
+  gwr_coef <- as.data.frame(gwr_fit$SDF@data)
+  varnames <- names(gwr_coef)
+  # 只取解释变量名（去掉 Intercept/Local_R2/残差）
+  model_vars <- setdiff(all.vars(fm), as.character(fm[[2]]))
+  for (v in model_vars) {
+  coef_name <- v
+  se_name   <- paste0(v, "_SE")
+  if (!all(c(coef_name, se_name) %in% varnames)) next
+  map_data <- gwr_data_nona %>%
+    mutate(
+      coef = gwr_coef[[coef_name]],
+      se   = gwr_coef[[se_name]],
+      tval = coef / se,
+      sig  = abs(tval) > 1.96,
+      coef_sigonly = ifelse(sig, coef, NA)
+    )
+  tm <- tm_shape(map_data) +
+    tm_polygons("coef_sigonly",
+                palette = "-RdBu",
+                title = paste0("GWR Coef: ", coef_name, " (", name, ")")) +
+    tm_layout(legend.outside = TRUE)
+  tmap_save(tm, paste0("data/gwr_", name, "_", coef_name, "_sigmap.png"),
+            width = 2000, height = 2500, dpi = 300, units = "px")
+  cat("  → 已输出显著区地图: data/gwr_", name, "_", coef_name, "_sigmap.png\n")
+}
+
+}
+
+cat("\n✅ 所有GWR模型所有变量的显著区地图已批量导出！\n")
+
+```
+
+
+```{r}
+formulas <- list(
+  mean_g    = gpg_mean   ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g,
+  median_g  = gpg_median ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g,
+  mean_w    = gpg_mean   ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w,
+  median_w  = gpg_median ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w,
+  mean_m    = gpg_mean   ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m,
+  median_m  = gpg_median ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m
+)
+
+
+# 只保留 Urban/Rural（假定为 Urban / Rural 字符型；如是 1/0 自行替换）
+reg_df <- reg_df %>% filter(!is.na(urban_rural_flag))
+
+results_list <- list()
+
+for (model_name in names(formulas)) {
+  fm <- formulas[[model_name]]
+  # 按城乡分组回归
+  results <- reg_df %>%
+    group_by(urban_rural_flag) %>%
+    group_map(~ tidy(lm(fm, data = .x)), .keep = TRUE)
+  # 命名
+  names(results) <- unique(reg_df$urban_rural_flag)
+  results_list[[model_name]] <- results
+}
+
+# 查看示例：Urban组mean_g模型
+results_list$mean_g[[1]]
+results_list$mean_g[[2]]
+
+```
+```{r}
+# Urban组
+urban_df <- filter(reg_df, urban_rural_flag == "urban")
+
+model3_mean_g_urban    <- lm(gpg_mean   ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = urban_df)
+summary(model3_mean_g_urban)
+
+model3_median_g_urban  <- lm(gpg_median ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = urban_df)
+summary(model3_median_g_urban)
+
+model3_mean_w_urban    <- lm(gpg_mean   ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = urban_df)
+summary(model3_mean_w_urban)
+
+model3_median_w_urban  <- lm(gpg_median ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = urban_df)
+summary(model3_median_w_urban)
+
+model3_mean_m_urban    <- lm(gpg_mean   ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = urban_df)
+summary(model3_mean_m_urban)
+
+model3_median_m_urban  <- lm(gpg_median ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = urban_df)
+summary(model3_median_m_urban)
+
+# Rural组
+rural_df <- filter(reg_df, urban_rural_flag == "rural")
+
+model3_mean_g_rural    <- lm(gpg_mean   ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = rural_df)
+summary(model3_mean_g_rural)
+
+model3_median_g_rural  <- lm(gpg_median ~ `paid work_g` + `unpaid work_g` + money_g + power_g + education_g + health_g, data = rural_df)
+summary(model3_median_g_rural)
+
+model3_mean_w_rural    <- lm(gpg_mean   ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = rural_df)
+summary(model3_mean_w_rural)
+
+model3_median_w_rural  <- lm(gpg_median ~ `Paid work_w` + `Unpaid work_w` + Money_w + Power_w + Education_w + Health_w, data = rural_df)
+summary(model3_median_w_rural)
+
+model3_mean_m_rural    <- lm(gpg_mean   ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = rural_df)
+summary(model3_mean_m_rural)
+
+model3_median_m_rural  <- lm(gpg_median ~ `Paid work_m` + `Unpaid work_m` + Money_m + Power_m + Education_m + Health_m, data = rural_df)
+summary(model3_median_m_rural)
+
+
+
+
+```
+
+```{r}
+library(modelsummary)
+
+# Urban组
+models_urban <- list(
+  "Mean: All (Urban)"     = model3_mean_g_urban,
+  "Median: All (Urban)"   = model3_median_g_urban,
+  "Mean: Women (Urban)"   = model3_mean_w_urban,
+  "Median: Women (Urban)" = model3_median_w_urban,
+  "Mean: Men (Urban)"     = model3_mean_m_urban,
+  "Median: Men (Urban)"   = model3_median_m_urban
+)
+
+# Rural组
+models_rural <- list(
+  "Mean: All (Rural)"     = model3_mean_g_rural,
+  "Median: All (Rural)"   = model3_median_g_rural,
+  "Mean: Women (Rural)"   = model3_mean_w_rural,
+  "Median: Women (Rural)" = model3_median_w_rural,
+  "Mean: Men (Rural)"     = model3_mean_m_rural,
+  "Median: Men (Rural)"   = model3_median_m_rural
+)
+
+var_names <- c(
+  "paid work_g"     = "Paid Work",
+  "unpaid work_g"   = "Unpaid Work",
+  "money_g"         = "Money",
+  "power_g"         = "Power",
+  "education_g"     = "Education",
+  "health_g"        = "Health",
+  "Paid work_w"     = "Paid Work (W)",
+  "Unpaid work_w"   = "Unpaid Work (W)",
+  "Money_w"         = "Money (W)",
+  "Power_w"         = "Power (W)",
+  "Education_w"     = "Education (W)",
+  "Health_w"        = "Health (W)",
+  "Paid work_m"     = "Paid Work (M)",
+  "Unpaid work_m"   = "Unpaid Work (M)",
+  "Money_m"         = "Money (M)",
+  "Power_m"         = "Power (M)",
+  "Education_m"     = "Education (M)",
+  "Health_m"        = "Health (M)"
+)
+
+# Urban组输出 Word
+modelsummary(
+  models_urban,
+  stars = TRUE,
+  coef_map = var_names,
+  statistic = "({std.error})",
+  gof_omit = "IC|Log.Lik.",
+  output = "urban_model3_table.docx"
+)
+
+# Rural组输出 Word
+modelsummary(
+  models_rural,
+  stars = TRUE,
+  coef_map = var_names,
+  statistic = "({std.error})",
+  gof_omit = "IC|Log.Lik.",
+  output = "rural_model3_table.docx"
+)
+
+```
+
